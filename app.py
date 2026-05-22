@@ -3,7 +3,7 @@ app.py — UN Shaming Cascade visualised with Mesa SolaraViz.
 
 Layout (top → bottom):
   1. Live counter  — step, shaming, neutral, dem/non-dem, P5 counts
-  2. Network map   — nodes sized & edges weighted by GDI diplomatic strength
+  2. Network map   — complete forum ties weighted by strength and regime
   3. Shaming plot  — Shaming vs Neutral over time
   4. Regime plot   — Democracy vs Non-democracy shaming over time
 
@@ -12,7 +12,7 @@ Network portrayal
   Node colour   : Red (#e8003d) = shaming, Dark-blue (#1e3a5f) = neutral
   Node border   : White = democracy, Amber = non-democracy
   Node size     : Scaled by diplomatic_strength (GDI 2024); P5 always largest
-  Edge colour   : Brightness proportional to edge weight (avg strength of pair)
+  Edge colour   : Brightness proportional to forum tie weight
   Edge width    : Proportional to edge weight
   Tooltip       : Country name, state, regime, GDI strength score, P5 status
 """
@@ -23,6 +23,7 @@ import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
 import networkx as nx
 import numpy as np
+import plotly.graph_objects as go
 
 from mesa.visualization.components.matplotlib_components import (
     update_counter,
@@ -83,126 +84,157 @@ def _get_pos(model: UNModel) -> dict:
 
 @solara.component
 def NetworkMap(model):
-    """Draws the UN diplomatic network every model step."""
+    """
+    Zoomable / pannable Plotly network map.
+    Scroll to zoom, drag to pan, hover for country details.
+    """
     update_counter.get()
 
     agents = model._agent_list
     G      = model.G
     pos    = _get_pos(model)
-    n      = len(agents)
-
-    fig, ax = plt.subplots(figsize=(72, 48), dpi=120)
-    fig.patch.set_facecolor("#0d1b2a")
-    ax.set_facecolor("#0d1b2a")
-    ax.set_axis_off()
 
     p5_ids = {i for i, a in enumerate(agents) if a.country_name in P5_NAMES}
 
-    # — Edges coloured and sized by diplomatic strength (edge weight) ──────────
-    edge_list   = list(G.edges(data=True))
-    hub_edges   = [(u, v) for u, v, _ in edge_list if u in p5_ids or v in p5_ids]
-    reg_edges   = [(u, v) for u, v, _ in edge_list if u not in p5_ids and v not in p5_ids]
+    # ── Edge traces (regular vs hub, batched with None separators) ────────────
+    reg_x, reg_y, hub_x, hub_y = [], [], [], []
+    for u, v, data in G.edges(data=True):
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        if u in p5_ids or v in p5_ids:
+            hub_x += [x0, x1, None]
+            hub_y += [y0, y1, None]
+        else:
+            reg_x += [x0, x1, None]
+            reg_y += [y0, y1, None]
 
-    def _edge_colors_widths(edges, base_alpha=0.4, hub=False):
-        colors, widths = [], []
-        for u, v in edges:
-            w = G[u][v].get("weight", 0.1)
-            # Interpolate from dim (#0e2a44) to bright (#3a7fc1) by weight
-            r = int(14  + w * (58  - 14))
-            g = int(42  + w * (127 - 42))
-            b = int(68  + w * (193 - 68))
-            colors.append(f"#{r:02x}{g:02x}{b:02x}")
-            widths.append(0.3 + w * (2.5 if hub else 1.2))
-        return colors, widths
+    edge_traces = []
+    if reg_x:
+        edge_traces.append(go.Scatter(
+            x=reg_x, y=reg_y, mode="lines",
+            line=dict(width=0.8, color="rgba(30,60,100,0.35)"),
+            hoverinfo="none", showlegend=False,
+        ))
+    if hub_x:
+        edge_traces.append(go.Scatter(
+            x=hub_x, y=hub_y, mode="lines",
+            line=dict(width=1.8, color="rgba(58,127,193,0.55)"),
+            hoverinfo="none", showlegend=False,
+        ))
 
-    reg_colors, reg_widths = _edge_colors_widths(reg_edges, hub=False)
-    hub_colors, hub_widths = _edge_colors_widths(hub_edges, hub=True)
+    # ── Node traces — four groups for the legend ──────────────────────────────
+    groups = {
+        ("dem",    "shame"):   {"label": "Democracy · Shaming",     "color": "#e8003d", "border": "#ffffff"},
+        ("dem",    "neutral"): {"label": "Democracy · Neutral",      "color": "#1e3a5f", "border": "#ffffff"},
+        ("nondem", "shame"):   {"label": "Non-democracy · Shaming",  "color": "#e8003d", "border": "#f39c12"},
+        ("nondem", "neutral"): {"label": "Non-democracy · Neutral",  "color": "#1e3a5f", "border": "#f39c12"},
+    }
+    group_data = {k: {"x": [], "y": [], "text": [], "size": [], "labels": []}
+                  for k in groups}
 
-    if reg_edges:
-        nx.draw_networkx_edges(
-            G, pos, edgelist=reg_edges, ax=ax,
-            edge_color=reg_colors, width=reg_widths, alpha=0.38,
-        )
-    if hub_edges:
-        nx.draw_networkx_edges(
-            G, pos, edgelist=hub_edges, ax=ax,
-            edge_color=hub_colors, width=hub_widths, alpha=0.60,
-        )
-
-    # — Nodes sized by diplomatic_strength ────────────────────────────────────
-    MIN_SZ, MAX_SZ = 300, 4000   # area in scatter units
-    P5_SZ          = 6000
-
-    node_colors     = []
-    node_edgecolors = []
-    node_sizes      = []
+    MIN_SZ, MAX_SZ, P5_SZ = 12, 55, 80
 
     for i, a in enumerate(agents):
-        node_colors.append("#e8003d" if a.state == SHAME else "#1e3a5f")
-        node_edgecolors.append("#ffffff" if a.regime == DEMOCRACY else "#f39c12")
-        if a.country_name in P5_NAMES:
-            node_sizes.append(P5_SZ)
-        else:
-            node_sizes.append(int(MIN_SZ + a.diplomatic_strength * (MAX_SZ - MIN_SZ)))
+        rk  = "dem" if a.regime == DEMOCRACY else "nondem"
+        key = (rk, a.state)
+        x, y = pos[i]
+        sz = P5_SZ if a.country_name in P5_NAMES else int(
+            MIN_SZ + a.diplomatic_strength * (MAX_SZ - MIN_SZ))
+        p5_tag = " \u2605 P5" if a.country_name in P5_NAMES else ""
 
-    regular_nodes = [i for i in range(n) if i not in p5_ids]
-    p5_node_list  = list(p5_ids)
+        # Compute normalised pressure for tooltip
+        raw_p = 0.0
+        max_p = 0.0
+        for nb_node in G.neighbors(i):
+            ew = G[i][nb_node].get("weight", 0.1)
+            max_p += ew
+            for nbr in model.grid.get_cell_list_contents([nb_node]):
+                if nbr.state == SHAME:
+                    raw_p += ew
+        norm_p    = (raw_p / max_p) if max_p > 0 else 0.0
+        threshold = a.threshold
+        eligible  = "Yes" if norm_p >= threshold else f"No (needs {threshold:.3f})"
 
-    nx.draw_networkx_nodes(
-        G, pos, nodelist=regular_nodes, ax=ax,
-        node_color=[node_colors[i] for i in regular_nodes],
-        node_size=[node_sizes[i]   for i in regular_nodes],
-        edgecolors=[node_edgecolors[i] for i in regular_nodes],
-        linewidths=1.0,
-    )
-    nx.draw_networkx_nodes(
-        G, pos, nodelist=p5_node_list, ax=ax,
-        node_color=[node_colors[i] for i in p5_node_list],
-        node_size=[node_sizes[i]   for i in p5_node_list],
-        edgecolors=[node_edgecolors[i] for i in p5_node_list],
-        linewidths=2.8,
-    )
+        tip = (
+            f"<b>{a.country_name}</b>{p5_tag}<br>"
+            f"State: {'Shaming' if a.state == 'shame' else 'Neutral'}<br>"
+            f"Regime: {'Democracy' if a.regime == DEMOCRACY else 'Non-democracy'}<br>"
+            f"GDI strength: {a.diplomatic_strength:.3f}<br>"
+            f"Network degree: {G.degree(i)}<br>"
+            f"Normalised pressure: {norm_p:.3f}<br>"
+            f"Personal threshold \u03b8: {threshold:.3f}  "
+            f"[\u03b1={a.alpha_param:.2f}, \u03b2={a.beta_param:.2f}]<br>"
+            f"Eligible for recruitment: {eligible}"
+        )
+        group_data[key]["x"].append(x)
+        group_data[key]["y"].append(y)
+        group_data[key]["text"].append(tip)
+        group_data[key]["size"].append(sz)
+        group_data[key]["labels"].append(a.short_name if a.country_name in P5_NAMES else "")
 
-    # — P5 labels ─────────────────────────────────────────────────────────────
-    nx.draw_networkx_labels(
-        G, {i: pos[i] for i in p5_node_list},
-        labels={i: agents[i].short_name for i in p5_node_list},
-        ax=ax, font_size=18, font_color="#e8f0ff", font_weight="bold",
-    )
+    node_traces = []
+    for key, meta in groups.items():
+        gd = group_data[key]
+        if not gd["x"]:
+            continue
+        node_traces.append(go.Scatter(
+            x=gd["x"], y=gd["y"],
+            mode="markers+text",
+            name=meta["label"],
+            marker=dict(
+                size=gd["size"],
+                color=meta["color"],
+                line=dict(color=meta["border"], width=2),
+                opacity=0.92,
+            ),
+            text=gd["labels"],
+            textposition="middle center",
+            textfont=dict(color="#e8f0ff", size=11, family="Arial Black"),
+            hovertext=gd["text"],
+            hoverinfo="text",
+            hoverlabel=dict(
+                bgcolor="#0d1b2a", bordercolor="#3a7fc1",
+                font=dict(color="#c9d8e8", size=13),
+            ),
+        ))
 
-    # — Legend ────────────────────────────────────────────────────────────────
-    legend_elements = [
-        mpatches.Patch(facecolor="#e8003d", edgecolor="#fff", label="Shaming"),
-        mpatches.Patch(facecolor="#1e3a5f", edgecolor="#fff", label="Neutral"),
-        mpatches.Patch(facecolor="#555", edgecolor="#ffffff", linewidth=1.5,
-                       label="Democracy (white border)"),
-        mpatches.Patch(facecolor="#555", edgecolor="#f39c12", linewidth=1.5,
-                       label="Non-democracy (amber border)"),
-        mpatches.Patch(facecolor="#888", edgecolor="#fff",
-                       label="Node size ∝ GDI diplomatic strength"),
-        mpatches.Patch(facecolor="#1e4a8a", edgecolor="#3a7fc1",
-                       label="Edge brightness ∝ avg diplomatic strength"),
-    ]
-    ax.legend(
-        handles=legend_elements, loc="lower left", fontsize=36,
-        framealpha=0.35, facecolor="#0d1b2a",
-        edgecolor="#1a3050", labelcolor="#c9d8e8",
-    )
-
-    # — Title ─────────────────────────────────────────────────────────────────
+    # ── Assemble Plotly figure ────────────────────────────────────────────────
     s = model.get_stats()
-    ax.set_title(
-        f"UN Shaming Cascade  ·  193 member states  ·  "
-        f"edge weights = Lowy GDI 2024 diplomatic strength\n"
-        f"Step {s['step']}  ·  {s['shaming']} shaming ({s['pct_shame']}%)  ·  "
-        f"Left = Democracies  ·  Right = Non-democracies  ·  "
-        f"Larger nodes = stronger diplomatic footprint",
-        color="#c9d8e8", fontsize=36, pad=12,
+    pfig = go.Figure(data=edge_traces + node_traces)
+    pfig.update_layout(
+        title=dict(
+            text=(
+                f"UN Shaming Cascade · 193 member states · "
+                f"complete forum network · weighted by strength + regime affinity<br>"
+                f"<sup>Step {s['step']} · {s['shaming']} shaming "
+                f"({s['pct_shame']}%) · Left = Democracies · "
+                f"Right = Non-democracies · Node size ∝ diplomatic strength</sup>"
+            ),
+            font=dict(color="#c9d8e8", size=22),
+            x=0.5, xanchor="center",
+        ),
+        paper_bgcolor="#0d1b2a",
+        plot_bgcolor="#0d1b2a",
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False,
+                   scaleanchor="x"),
+        legend=dict(
+            font=dict(color="#c9d8e8", size=18),
+            bgcolor="rgba(13,27,42,0.7)",
+            bordercolor="#1a3050",
+            borderwidth=1,
+            itemsizing="constant",
+            x=0.01, y=0.01,
+        ),
+        margin=dict(l=10, r=10, t=90, b=10),
+        height=900,
+        autosize=True,
+        dragmode="pan",
+        uirevision="network",
     )
 
-    fig.tight_layout(pad=0.5)
-    solara.FigureMatplotlib(fig, dependencies=[model.step_count])
-    plt.close(fig)
+    with solara.Column(style="width:100%; max-width:100%;"):
+        solara.FigurePlotly(pfig)
 
 
 # ── Time-series plots (full-width custom components) ─────────────────────────
@@ -247,6 +279,80 @@ def RegimePlot(model):
         spine.set_edgecolor("#1a3050")
     ax.legend(fontsize=32, facecolor="#0d1b2a", edgecolor="#1a3050", labelcolor="#c9d8e8")
     fig.tight_layout(pad=0.5)
+    solara.FigureMatplotlib(fig, dependencies=[model.step_count])
+    plt.close(fig)
+
+
+@solara.component
+def ThresholdPlot(model):
+    """
+    Three-panel Granovetter threshold plot.
+      Top    : Mean threshold over time (with ±1 std band).
+      Middle : Norm-erosion index — fraction of agents whose beta has risen
+               above baseline (Barnett & Finnemore 2004 internalisation metric).
+      Bottom : Current threshold distribution as a histogram (all 193 agents).
+    """
+    update_counter.get()
+    df = model.datacollector.get_model_vars_dataframe()
+
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(72, 48), dpi=120)
+    fig.patch.set_facecolor("#0d1b2a")
+    for ax in (ax1, ax2, ax3):
+        ax.set_facecolor("#0d1b2a")
+        ax.tick_params(colors="#c9d8e8", labelsize=28)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#1a3050")
+
+    # Panel 1: mean threshold ± std
+    if not df.empty and "MeanThreshold" in df.columns:
+        mu  = df["MeanThreshold"]
+        std = df["StdThreshold"]
+        ax1.plot(df.index, mu,  color="#f0c040", linewidth=2, label="Mean threshold")
+        ax1.fill_between(df.index, mu - std, mu + std,
+                         color="#f0c040", alpha=0.20, label="±1 std")
+        ax1.set_ylim(0, 1)
+    ax1.set_xlabel("Step", color="#c9d8e8", fontsize=36)
+    ax1.set_ylabel("Threshold", color="#c9d8e8", fontsize=36)
+    ax1.set_title(
+        "Mean Granovetter threshold over time  "
+        "(rising = norm eroding / deviation normalised)",
+        color="#c9d8e8", fontsize=36, pad=20)
+    ax1.legend(fontsize=32, facecolor="#0d1b2a", edgecolor="#1a3050", labelcolor="#c9d8e8")
+
+    # Panel 2: norm-erosion index
+    if not df.empty and "NormEroding" in df.columns:
+        ax2.plot(df.index, df["NormEroding"] / 100,
+                 color="#e8003d", linewidth=2, label="Norm-erosion index")
+        ax2.set_ylim(0, 1)
+    ax2.set_xlabel("Step", color="#c9d8e8", fontsize=36)
+    ax2.set_ylabel("Fraction", color="#c9d8e8", fontsize=36)
+    ax2.set_title(
+        "Norm-erosion index  "
+        "(fraction of agents who have internalised deviation as acceptable)",
+        color="#c9d8e8", fontsize=36, pad=20)
+    ax2.legend(fontsize=32, facecolor="#0d1b2a", edgecolor="#1a3050", labelcolor="#c9d8e8")
+
+    # Panel 3: current threshold distribution histogram
+    thresholds = [a.threshold for a in model._agent_list]
+    dem_t      = [a.threshold for a in model._agent_list if a.regime == DEMOCRACY]
+    ndem_t     = [a.threshold for a in model._agent_list if a.regime != DEMOCRACY]
+    bins = 30
+    ax3.hist(dem_t,  bins=bins, color="royalblue", alpha=0.65,
+             label="Democracies",     edgecolor="#0d1b2a")
+    ax3.hist(ndem_t, bins=bins, color="tomato",    alpha=0.65,
+             label="Non-democracies", edgecolor="#0d1b2a")
+    s = model.get_stats()
+    ax3.axvline(s["mean_threshold"], color="#f0c040", linewidth=3,
+                linestyle="--", label=f"Mean θ={s['mean_threshold']:.3f}")
+    ax3.set_xlabel("Individual threshold θ", color="#c9d8e8", fontsize=36)
+    ax3.set_ylabel("# agents", color="#c9d8e8", fontsize=36)
+    ax3.set_title(
+        "Current Granovetter threshold distribution  "
+        "(Barnett & Finnemore 2004: deviation internalised as new norm when distribution shifts right)",
+        color="#c9d8e8", fontsize=36, pad=20)
+    ax3.legend(fontsize=32, facecolor="#0d1b2a", edgecolor="#1a3050", labelcolor="#c9d8e8")
+
+    fig.tight_layout(pad=1.2)
     solara.FigureMatplotlib(fig, dependencies=[model.step_count])
     plt.close(fig)
 
@@ -308,6 +414,16 @@ def LiveCounter(model):
                     "by GDI strength", sub_color="#406040",
                     border_color="#1a4030", label_color="#4a8a6a")
 
+            # Mean Granovetter threshold
+            + _tile("MEAN θ", f"{s['mean_threshold']:.3f}", "#f0c040",
+                    f"±{s['std_threshold']:.3f} std", sub_color="#906010",
+                    border_color="#2a3010", label_color="#8a8a20")
+
+            # Norm-erosion index
+            + _tile("NORM ERODING", f"{s['norm_eroding']}%", "#e87060",
+                    "agents above baseline", sub_color="#803020",
+                    border_color="#3a1010", label_color="#8a4030")
+
             + '</div>'
         ),
     )
@@ -343,7 +459,7 @@ def _tile(
 def PageLayout(model):
     solara.Style("""
         .un-full-width {
-            width: 85vw !important;
+            width: 100vw !important;
             max-width: 100vw !important;
             margin-left: calc(-50vw + 50%) !important;
             box-sizing: border-box;
@@ -361,6 +477,7 @@ def PageLayout(model):
         NetworkMap(model)
         ShamingPlot(model)
         RegimePlot(model)
+        ThresholdPlot(model)
 
 
 # ── Model parameters ──────────────────────────────────────────────────────────
@@ -371,10 +488,15 @@ model_params = {
         "value": 42,
         "label": "Random seed",
     },
-    "shame_threshold": {
+    "alpha": {
         "type":  "InputText",
-        "value": 0.50,
-        "label": "Shame threshold θ  (0.0 – 1.0)",
+        "value": 2.0,
+        "label": "Alpha — Beta left-skew (higher = easier cascades globally)",
+    },
+    "beta_scale": {
+        "type":  "InputText",
+        "value": 1.0,
+        "label": "Beta scale — initial threshold height (higher = harder cascades)",
     },
     "shame_min": {
         "type":  "InputText",

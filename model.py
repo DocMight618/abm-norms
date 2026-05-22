@@ -11,27 +11,33 @@ Source: Lowy Institute Global Diplomacy Index 2024.
     post count derived from their regional group and population tier.
   • All raw counts are normalised to [0, 1] relative to China (max = 274 posts).
 
-Edge weights
-────────────
-An edge between countries A and B gets weight:
-    w(A, B) = (strength[A] + strength[B]) / 2
-clipped to [0, 1].  Stronger nations exert more influence on each other.
-
-Network structure
-─────────────────
-  • Intra-regime edges drawn with probability scaled by avg diplomatic strength.
-  • Cross-regime edges drawn with lower base probability, also strength-scaled.
-  • P5 members are connected to ALL agents in their regime cluster and to
-    each other (regardless of probability draw).
-  • P5 members receive p5_extra additional random cross-cluster edges.
+Forum network
+─────────────
+The UN forum is represented as a complete weighted graph: every state can
+observe every other state, but influence is uneven. Edge weights combine
+diplomatic strength, regime affinity, and a small P5 amplification.
 
 Spreading mechanic
 ──────────────────
   spread > 0 : recruit NEUTRAL agents weighted by neighbour shaming pressure
                AND by the edge weight (stronger diplomatic tie = more pressure).
                P5 shamers grant a 2× bonus to their neighbours.
+               Only agents whose normalised pressure crosses their individual
+               threshold are eligible before weighted sampling.
   spread < 0 : revert SHAMING agents; weaker states easier to flip; P5 halved.
   spread = 0 : no global spread / reversion.
+
+Per-agent Granovetter threshold distribution (Option B)
+───────────────────────────────────────────────────────
+Each agent draws its own threshold from Beta(alpha, beta_agent) at
+construction.  beta_agent is anchored to (1 - diplomatic_strength) and
+a regime factor (democracies lower, non-democracies higher, P5 lowest).
+After each cascade window the model updates each neutral agent's beta_param
+and redraws its threshold based on cascade outcome:
+  large cascade  --> beta drifts down  (norm consolidating, easier to join)
+  small cascade  --> beta drifts up    (norm eroding, deviation normalised)
+
+Global model params: alpha (left-skew, shared), beta_scale (starting threshold scale).
 
 Every NEUTRAL_RESET_EVERY (5) steps states are re-randomised; network is fixed.
 """
@@ -42,97 +48,59 @@ from mesa import Model
 from mesa.space import NetworkGrid
 from mesa.datacollection import DataCollector
 
-from agent import CountryAgent, NEUTRAL, SHAME, DEMOCRACY, NON_DEMOCRACY
+from agent import (
+    CountryAgent,
+    NEUTRAL,
+    SHAME,
+    DEMOCRACY,
+    NON_DEMOCRACY,
+    P5_NAMES,
+)
 
 
 # ── 193 UN General Assembly members ──────────────────────────────────────────
-_UN_193: list[tuple[str, str]] = [
-    ("Afghanistan", "Afghan."), ("Albania", "Albania"), ("Algeria", "Algeria"),
-    ("Andorra", "Andorra"), ("Angola", "Angola"),
-    ("Antigua and Barbuda", "Antigua"), ("Argentina", "Argent."),
-    ("Armenia", "Armenia"), ("Australia", "Austral"), ("Austria", "Austria"),
-    ("Azerbaijan", "Azerba."), ("Bahamas", "Bahamas"), ("Bahrain", "Bahrain"),
-    ("Bangladesh", "Banglad"), ("Barbados", "Barbado"), ("Belarus", "Belarus"),
-    ("Belgium", "Belgium"), ("Belize", "Belize"), ("Benin", "Benin"),
-    ("Bhutan", "Bhutan"), ("Bolivia", "Bolivia"),
-    ("Bosnia and Herzegovina", "Bosnia"), ("Botswana", "Botswan"),
-    ("Brazil", "Brazil"), ("Brunei Darussalam", "Brunei"),
-    ("Bulgaria", "Bulgari"), ("Burkina Faso", "Burkina"),
-    ("Burundi", "Burundi"), ("Cabo Verde", "C.Verde"),
-    ("Cambodia", "Cambod."), ("Cameroon", "Cameroo"), ("Canada", "Canada"),
-    ("Central African Republic", "CAR"), ("Chad", "Chad"), ("Chile", "Chile"),
-    ("China", "China"), ("Colombia", "Colombi"), ("Comoros", "Comoros"),
-    ("Congo", "Congo"), ("Democratic Republic of the Congo", "DR Congo"),
-    ("Costa Rica", "C.Rica"), ("Côte d'Ivoire", "C.Ivoir"),
-    ("Croatia", "Croatia"), ("Cuba", "Cuba"), ("Cyprus", "Cyprus"),
-    ("Czech Republic", "Czech R"), ("Denmark", "Denmark"),
-    ("Djibouti", "Djibouti"), ("Dominica", "Dominic"),
-    ("Dominican Republic", "Dom.Rep"), ("Ecuador", "Ecuador"),
-    ("Egypt", "Egypt"), ("El Salvador", "El Salv"),
-    ("Equatorial Guinea", "Eq.Guin"), ("Eritrea", "Eritrea"),
-    ("Estonia", "Estonia"), ("Eswatini", "Eswatin"),
-    ("Ethiopia", "Ethiopi"), ("Fiji", "Fiji"), ("Finland", "Finland"),
-    ("France", "France"), ("Gabon", "Gabon"), ("Gambia", "Gambia"),
-    ("Georgia", "Georgia"), ("Germany", "Germany"), ("Ghana", "Ghana"),
-    ("Greece", "Greece"), ("Grenada", "Grenada"), ("Guatemala", "Guatema"),
-    ("Guinea", "Guinea"), ("Guinea-Bissau", "Guin-B."), ("Guyana", "Guyana"),
-    ("Haiti", "Haiti"), ("Honduras", "Hondura"), ("Hungary", "Hungary"),
-    ("Iceland", "Iceland"), ("India", "India"), ("Indonesia", "Indones"),
-    ("Iran", "Iran"), ("Iraq", "Iraq"), ("Ireland", "Ireland"),
-    ("Israel", "Israel"), ("Italy", "Italy"), ("Jamaica", "Jamaica"),
-    ("Japan", "Japan"), ("Jordan", "Jordan"), ("Kazakhstan", "Kazakhs"),
-    ("Kenya", "Kenya"), ("Kiribati", "Kiribat"),
-    ("Democratic People's Republic of Korea", "N.Korea"),
-    ("Republic of Korea", "S.Korea"), ("Kuwait", "Kuwait"),
-    ("Kyrgyzstan", "Kyrgyz."),
-    ("Lao People's Democratic Republic", "Laos"), ("Latvia", "Latvia"),
-    ("Lebanon", "Lebanon"), ("Lesotho", "Lesotho"), ("Liberia", "Liberia"),
-    ("Libya", "Libya"), ("Liechtenstein", "Liechtn"),
-    ("Lithuania", "Lithuan"), ("Luxembourg", "Luxembg"),
-    ("Madagascar", "Madagas"), ("Malawi", "Malawi"), ("Malaysia", "Malaysi"),
-    ("Maldives", "Maldive"), ("Mali", "Mali"), ("Malta", "Malta"),
-    ("Marshall Islands", "Marshal"), ("Mauritania", "Maurita"),
-    ("Mauritius", "Mauriti"), ("Mexico", "Mexico"),
-    ("Federated States of Micronesia", "Micrones"),
-    ("Republic of Moldova", "Moldova"), ("Monaco", "Monaco"),
-    ("Mongolia", "Mongoli"), ("Montenegro", "Montene"), ("Morocco", "Morocco"),
-    ("Mozambique", "Mozambi"), ("Myanmar", "Myanmar"), ("Namibia", "Namibia"),
-    ("Nauru", "Nauru"), ("Nepal", "Nepal"), ("Netherlands", "Netherl"),
-    ("New Zealand", "N.Zeala"), ("Nicaragua", "Nicarag"), ("Niger", "Niger"),
-    ("Nigeria", "Nigeria"), ("North Macedonia", "N.Maced"), ("Norway", "Norway"),
-    ("Oman", "Oman"), ("Pakistan", "Pakista"), ("Palau", "Palau"),
-    ("Panama", "Panama"), ("Papua New Guinea", "Papua"), ("Paraguay", "Paragua"),
-    ("Peru", "Peru"), ("Philippines", "Philipp"), ("Poland", "Poland"),
-    ("Portugal", "Portuga"), ("Qatar", "Qatar"), ("Romania", "Romania"),
-    ("Russia", "Russia"), ("Rwanda", "Rwanda"),
-    ("Saint Kitts and Nevis", "St.Kitts"), ("Saint Lucia", "St.Lucia"),
-    ("Saint Vincent and the Grenadines", "St.Vinc"), ("Samoa", "Samoa"),
-    ("San Marino", "S.Marin"), ("Sao Tome and Principe", "SaoTome"),
-    ("Saudi Arabia", "S.Arabi"), ("Senegal", "Senegal"), ("Serbia", "Serbia"),
-    ("Seychelles", "Seychel"), ("Sierra Leone", "S.Leone"),
-    ("Singapore", "Singapor"), ("Slovakia", "Slovak."),
-    ("Slovenia", "Sloveni"), ("Solomon Islands", "Solomon"),
-    ("Somalia", "Somalia"), ("South Africa", "S.Afric"),
-    ("South Sudan", "S.Sudan"), ("Spain", "Spain"), ("Sri Lanka", "SriLank"),
-    ("Sudan", "Sudan"), ("Suriname", "Surinam"), ("Sweden", "Sweden"),
-    ("Switzerland", "Swiss"), ("Syria", "Syria"), ("Tajikistan", "Tajikis"),
-    ("United Republic of Tanzania", "Tanzani"), ("Thailand", "Thailan"),
-    ("Timor-Leste", "Timor"), ("Togo", "Togo"), ("Tonga", "Tonga"),
-    ("Trinidad and Tobago", "TrinTob"), ("Tunisia", "Tunisia"),
-    ("Turkey", "Turkey"), ("Turkmenistan", "Turkmen"), ("Tuvalu", "Tuvalu"),
-    ("Uganda", "Uganda"), ("Ukraine", "Ukraine"),
-    ("United Arab Emirates", "UAE"), ("United Kingdom", "UK"),
-    ("United States of America", "USA"), ("Uruguay", "Uruguay"),
-    ("Uzbekistan", "Uzbekis"), ("Vanuatu", "Vanuatu"),
-    ("Venezuela", "Venezue"), ("Viet Nam", "VietNam"),
-    ("Yemen", "Yemen"), ("Zambia", "Zambia"), ("Zimbabwe", "Zimbabw"),
+_UN_193: list[str] = [
+    "Afghanistan", "Albania", "Algeria", "Andorra", "Angola",
+    "Antigua and Barbuda", "Argentina", "Armenia", "Australia", "Austria",
+    "Azerbaijan", "Bahamas", "Bahrain", "Bangladesh", "Barbados", "Belarus",
+    "Belgium", "Belize", "Benin", "Bhutan", "Bolivia",
+    "Bosnia and Herzegovina", "Botswana", "Brazil", "Brunei Darussalam",
+    "Bulgaria", "Burkina Faso", "Burundi", "Cabo Verde", "Cambodia",
+    "Cameroon", "Canada", "Central African Republic", "Chad", "Chile",
+    "China", "Colombia", "Comoros", "Congo",
+    "Democratic Republic of the Congo", "Costa Rica", "Côte d'Ivoire",
+    "Croatia", "Cuba", "Cyprus", "Czech Republic", "Denmark", "Djibouti",
+    "Dominica", "Dominican Republic", "Ecuador", "Egypt", "El Salvador",
+    "Equatorial Guinea", "Eritrea", "Estonia", "Eswatini", "Ethiopia",
+    "Fiji", "Finland", "France", "Gabon", "Gambia", "Georgia", "Germany",
+    "Ghana", "Greece", "Grenada", "Guatemala", "Guinea", "Guinea-Bissau",
+    "Guyana", "Haiti", "Honduras", "Hungary", "Iceland", "India",
+    "Indonesia", "Iran", "Iraq", "Ireland", "Israel", "Italy", "Jamaica",
+    "Japan", "Jordan", "Kazakhstan", "Kenya", "Kiribati",
+    "Democratic People's Republic of Korea", "Republic of Korea", "Kuwait",
+    "Kyrgyzstan", "Lao People's Democratic Republic", "Latvia", "Lebanon",
+    "Lesotho", "Liberia", "Libya", "Liechtenstein", "Lithuania",
+    "Luxembourg", "Madagascar", "Malawi", "Malaysia", "Maldives", "Mali",
+    "Malta", "Marshall Islands", "Mauritania", "Mauritius", "Mexico",
+    "Federated States of Micronesia", "Republic of Moldova", "Monaco",
+    "Mongolia", "Montenegro", "Morocco", "Mozambique", "Myanmar", "Namibia",
+    "Nauru", "Nepal", "Netherlands", "New Zealand", "Nicaragua", "Niger",
+    "Nigeria", "North Macedonia", "Norway", "Oman", "Pakistan", "Palau",
+    "Panama", "Papua New Guinea", "Paraguay", "Peru", "Philippines",
+    "Poland", "Portugal", "Qatar", "Romania", "Russia", "Rwanda",
+    "Saint Kitts and Nevis", "Saint Lucia",
+    "Saint Vincent and the Grenadines", "Samoa", "San Marino",
+    "Sao Tome and Principe", "Saudi Arabia", "Senegal", "Serbia",
+    "Seychelles", "Sierra Leone", "Singapore", "Slovakia", "Slovenia",
+    "Solomon Islands", "Somalia", "South Africa", "South Sudan", "Spain",
+    "Sri Lanka", "Sudan", "Suriname", "Sweden", "Switzerland", "Syria",
+    "Tajikistan", "United Republic of Tanzania", "Thailand", "Timor-Leste",
+    "Togo", "Tonga", "Trinidad and Tobago", "Tunisia", "Turkey",
+    "Turkmenistan", "Tuvalu", "Uganda", "Ukraine", "United Arab Emirates",
+    "United Kingdom", "United States of America", "Uruguay", "Uzbekistan",
+    "Vanuatu", "Venezuela", "Viet Nam", "Yemen", "Zambia", "Zimbabwe",
 ]
-assert len(_UN_193) == 193 and len(set(n for n, _ in _UN_193)) == 193
-
-# UN Security Council P5 permanent members
-P5_NAMES: frozenset[str] = frozenset({
-    "China", "France", "Russia", "United Kingdom", "United States of America",
-})
+assert len(_UN_193) == 193 and len(set(_UN_193)) == 193
 
 # ── Lowy Institute GDI 2024: total diplomatic posts per country ───────────────
 # Source: Wikipedia / GDI 2024
@@ -371,74 +339,38 @@ def _safe_int(value, default: int) -> int:
 
 def _build_un_network(
     agents: list,
-    rng,
-    p_intra: float = 0.25,
-    p_inter: float = 0.06,
-    p5_extra: int  = 20,
 ) -> nx.Graph:
     """
-    Build a weighted undirected network of 193 UN member state agents.
+    Build a complete weighted forum network.
 
-    Edge weight w(A,B) = (strength[A] + strength[B]) / 2  ∈ (0, 1].
+    In the UN, every state can observe every other state's public position.
+    The model therefore gives every pair a tie and lets the edge weight encode
+    how persuasive or salient that tie is:
 
-    Connection rules:
-    1. Same-regime pair: edge drawn with prob  p_intra * 4 * avg_strength(A,B)
-    2. Cross-regime pair: edge drawn with prob p_inter * 4 * avg_strength(A,B)
-       Stronger nations are more likely to be connected (incl. across regimes).
-    3. Every P5 member → all agents in its own regime cluster (guaranteed).
-    4. All P5 members fully connected to each other.
-    5. Each P5 member gets p5_extra additional random cross-cluster edges.
+      influence core   = 0.20 + 0.80 * average diplomatic strength
+      regime affinity  = 1.00 for same-regime pairs, 0.65 otherwise
+      P5 visibility    = 1.15 when either endpoint is a P5 member
+
+    The 0.20 floor keeps weak states visible in the forum, while strength,
+    regime affinity, and P5 status determine how much pressure flows.
     """
     G = nx.Graph()
     G.add_nodes_from(range(len(agents)))
 
-    strengths = [a.diplomatic_strength for a in agents]
-
-    dem_idx  = [i for i, a in enumerate(agents) if a.regime == DEMOCRACY]
-    ndem_idx = [i for i, a in enumerate(agents) if a.regime != DEMOCRACY]
-    p5_idx   = [i for i, a in enumerate(agents) if a.country_name in P5_NAMES]
-
-    def _add(u, v):
-        w = (strengths[u] + strengths[v]) / 2
-        if G.has_edge(u, v):
-            G[u][v]["weight"] = max(G[u][v]["weight"], w)
-        else:
-            G.add_edge(u, v, weight=w)
-
-    # 1. Intra-regime probabilistic edges (strength-scaled)
-    for cluster in (dem_idx, ndem_idx):
-        for ii in range(len(cluster)):
-            for jj in range(ii + 1, len(cluster)):
-                u, v = cluster[ii], cluster[jj]
-                avg_s = (strengths[u] + strengths[v]) / 2
-                if rng.random() < p_intra * avg_s * 4:
-                    _add(u, v)
-
-    # 2. Cross-regime probabilistic edges (strength-scaled, lower base)
-    for di in dem_idx:
-        for ni in ndem_idx:
-            avg_s = (strengths[di] + strengths[ni]) / 2
-            if rng.random() < p_inter * avg_s * 4:
-                _add(di, ni)
-
-    # 3. P5 → all same-regime agents (guaranteed hub connections)
-    for pi in p5_idx:
-        cluster = dem_idx if agents[pi].regime == DEMOCRACY else ndem_idx
-        for ci in cluster:
-            if ci != pi:
-                _add(pi, ci)
-
-    # 4. P5 fully inter-connected (cross-regime P5 links)
-    for ii in range(len(p5_idx)):
-        for jj in range(ii + 1, len(p5_idx)):
-            _add(p5_idx[ii], p5_idx[jj])
-
-    # 5. P5 extra cross-cluster edges
-    for pi in p5_idx:
-        cross = ndem_idx if agents[pi].regime == DEMOCRACY else dem_idx
-        sample_k = min(p5_extra, len(cross))
-        for ci in rng.sample(cross, sample_k):
-            _add(pi, ci)
+    for u in range(len(agents)):
+        for v in range(u + 1, len(agents)):
+            a = agents[u]
+            b = agents[v]
+            avg_strength = (a.diplomatic_strength + b.diplomatic_strength) / 2
+            influence = 0.20 + (0.80 * avg_strength)
+            regime_affinity = 1.00 if a.regime == b.regime else 0.65
+            p5_visibility = (
+                1.15
+                if a.country_name in P5_NAMES or b.country_name in P5_NAMES
+                else 1.00
+            )
+            weight = min(1.0, influence * regime_affinity * p5_visibility)
+            G.add_edge(u, v, weight=round(max(0.01, weight), 4))
 
     return G
 
@@ -449,14 +381,20 @@ class UNModel(Model):
     """
     Parameters
     ----------
-    shame_threshold : display threshold shown in tooltips (0.0–1.0)
-    shame_min       : minimum initial shamers (0–193)
-    shame_max       : maximum initial shamers (0–193)
-    spread          : signed integer
-                        > 0 → recruit up to this many neutrals per step
-                        < 0 → revert up to |spread| shamers per step
-                        = 0 → no spread
-    seed            : RNG seed
+    alpha       : float  Beta distribution alpha (shared, controls global left-skew).
+                  Higher alpha = distribution mass shifts left = lower thresholds
+                  globally = easier cascades.  Default 2.0.
+    beta_scale  : float  Multiplier on each agent's baseline beta before first draw.
+                  Higher beta_scale = higher initial thresholds = harder cascades.
+                  Default 1.0.
+    shame_min   : minimum initial shamers (0–193)
+    shame_max   : maximum initial shamers (0–193)
+    spread      : signed integer
+                    > 0 → recruit up to this many neutrals per step
+                    < 0 → revert up to |spread| shamers per step
+                    = 0 → no spread
+    seed        : UI-facing random seed. Passed to Mesa as rng because the
+                  seed keyword is deprecated in Mesa.
     """
 
     N_AGENTS            = 193
@@ -464,15 +402,17 @@ class UNModel(Model):
 
     def __init__(
         self,
-        shame_threshold = 0.50,
-        shame_min       = 20,
-        shame_max       = 77,
-        spread          = 10,
-        seed            = None,
+        alpha       = 2.0,
+        beta_scale  = 1.0,
+        shame_min   = 20,
+        shame_max   = 77,
+        spread      = 10,
+        seed        = None,
     ):
-        super().__init__(seed=_safe_int(seed, 42))
+        super().__init__(rng=_safe_int(seed, 42))
 
-        self.shame_threshold = max(0.0, min(1.0, _safe_float(shame_threshold, 0.50)))
+        self.alpha      = max(0.1, _safe_float(alpha, 2.0))
+        self.beta_scale = max(0.1, _safe_float(beta_scale, 1.0))
 
         raw_min = _safe_int(shame_min, 20)
         raw_max = _safe_int(shame_max, 77)
@@ -484,34 +424,36 @@ class UNModel(Model):
         raw_spread = _safe_int(spread, 10)
         self.spread = max(-self.N_AGENTS, min(self.N_AGENTS, raw_spread))
 
-        self.step_count = 0
+        self.step_count       = 0
+        self._cascade_history: list[float] = []   # fraction shaming at each window end
 
-        # Build agents (diplomatic_strength set before network construction)
+        # Build agents (diplomatic_strength + threshold set before network)
         self._agent_list: list[CountryAgent] = []
         self._build_agents()
 
-        # Build weighted network and attach Mesa NetworkGrid
-        self.G    = _build_un_network(self._agent_list, self.random)
+        # Build the complete weighted forum network and attach Mesa NetworkGrid.
+        self.G    = _build_un_network(self._agent_list)
         self.grid = NetworkGrid(self.G)
 
         for i, agent in enumerate(self._agent_list):
             self.grid.place_agent(agent, i)
 
-        self._p5_agents: list[CountryAgent] = [
-            a for a in self._agent_list if a.country_name in P5_NAMES
-        ]
-
         self.datacollector = DataCollector(
             model_reporters={
-                "Shaming":     lambda m: m._count(SHAME),
-                "Neutral":     lambda m: m._count(NEUTRAL),
-                "DemShame":    lambda m: m._regime_count(DEMOCRACY,     SHAME),
-                "NonDemShame": lambda m: m._regime_count(NON_DEMOCRACY, SHAME),
+                "Shaming":        lambda m: m._count(SHAME),
+                "Neutral":        lambda m: m._count(NEUTRAL),
+                "DemShame":       lambda m: m._regime_count(DEMOCRACY,     SHAME),
+                "NonDemShame":    lambda m: m._regime_count(NON_DEMOCRACY, SHAME),
+                "MeanThreshold":  lambda m: m._mean_threshold(),
+                "StdThreshold":   lambda m: m._std_threshold(),
+                "NormEroding":    lambda m: m._norm_eroding(),
             },
             agent_reporters={
                 "State":              "state",
                 "Regime":             "regime",
                 "DiplomaticStrength": "diplomatic_strength",
+                "Threshold":          "threshold",
+                "BetaParam":          "beta_param",
             },
         )
 
@@ -523,9 +465,10 @@ class UNModel(Model):
     def _build_agents(self) -> None:
         entries = list(_UN_193)
         self.random.shuffle(entries)
-        for full_name, short_name in entries:
-            a = CountryAgent(self, full_name, short_name)
+        for full_name in entries:
+            a = CountryAgent(self, full_name)
             a.diplomatic_strength = _diplomatic_strength(full_name)
+            a.initialise_threshold(self.alpha, self.beta_scale, self.random)
             self._agent_list.append(a)
 
     # ── State reset ───────────────────────────────────────────────────────────
@@ -536,8 +479,7 @@ class UNModel(Model):
             max(0, self.shame_max),
         )
         n_shame = min(n_shame, self.N_AGENTS)
-        for a in self._agent_list:
-            a.reset(NEUTRAL)
+        self.agents.do("reset", NEUTRAL)
         if n_shame > 0:
             for a in self.random.sample(self._agent_list, n_shame):
                 a.reset(SHAME)
@@ -548,27 +490,33 @@ class UNModel(Model):
         self.step_count += 1
 
         if self.step_count % self.NEUTRAL_RESET_EVERY == 0:
+            # Record cascade outcome before reset, then update thresholds
+            cascade_frac = self._count(SHAME) / self.N_AGENTS
+            self._cascade_history.append(cascade_frac)
+            self.agents.do("update_threshold", cascade_frac, self.random)
             self._randomise_states()
 
-        for agent in self.agents:
-            agent.step()
+        # Phase 1: every agent copies its visible state to a buffer. This keeps
+        # spread/reversion synchronous; no agent reacts to another's new choice
+        # until the commit phase below.
+        self.agents.do("step")
 
         if self.spread > 0:
             self._apply_spread(self.spread)
         elif self.spread < 0:
             self._apply_revert(abs(self.spread))
 
-        for agent in self.agents:
-            agent.advance()
+        # Phase 2: commit all buffered choices together.
+        self.agents.do("advance")
 
         self.datacollector.collect(self)
 
     def _apply_spread(self, n: int) -> None:
         """
         Recruit up to `n` NEUTRAL agents to SHAME.
-        Recruitment probability weighted by:
-          • sum of edge-weight-scaled shaming neighbour pressure
-          • 2× bonus if any P5 shaming neighbour is present
+
+        Agent-level threshold and pressure rules live in CountryAgent.
+        This method only groups candidates and samples from their weights.
         """
         dem_neutrals = [
             a for a in self._agent_list
@@ -582,30 +530,27 @@ class UNModel(Model):
         for pool in (dem_neutrals, nondem_neutrals):
             if not pool:
                 continue
-            k = self.random.randint(0, min(n, len(pool)))
+
+            eligible = []
+            weights  = []
+            for a in pool:
+                weight = a.recruitment_weight(self.G, self.grid)
+                if weight > 0:
+                    eligible.append(a)
+                    weights.append(weight)
+
+            if not eligible:
+                continue
+
+            k = self.random.randint(0, min(n, len(eligible)))
             if not k:
                 continue
-            weights = []
-            for a in pool:
-                pressure = 0.0
-                p5_bonus = 1.0
-                for nb_node in self.G.neighbors(a.pos):
-                    ew = self.G[a.pos][nb_node].get("weight", 0.1)
-                    for nbr in self.grid.get_cell_list_contents([nb_node]):
-                        if nbr._next_state == SHAME:
-                            pressure += ew
-                            if nbr.country_name in P5_NAMES:
-                                p5_bonus = 2.0
-                weights.append(pressure * p5_bonus + 0.01)
 
-            total = sum(weights)
-            probs = [w / total for w in weights]
-            chosen = self.random.choices(pool, weights=probs, k=min(k, len(pool)))
-            seen = set()
+            chosen = self._weighted_sample_without_replacement(
+                eligible, weights, min(k, len(eligible))
+            )
             for a in chosen:
-                if id(a) not in seen:
-                    a._next_state = SHAME
-                    seen.add(id(a))
+                a.choose_shaming()
 
     def _apply_revert(self, n: int) -> None:
         """
@@ -616,27 +561,76 @@ class UNModel(Model):
         shamers = [a for a in self._agent_list if a._next_state == SHAME]
         if not shamers:
             return
-        weights = []
-        for a in shamers:
-            w = 1.0 - a.diplomatic_strength
-            if a.country_name in P5_NAMES:
-                w *= 0.5
-            weights.append(max(w, 0.01))
+        weights = [a.revert_weight() for a in shamers]
         k = self.random.randint(0, min(n, len(shamers)))
         if k:
-            total = sum(weights)
-            probs = [w / total for w in weights]
-            chosen = self.random.choices(shamers, weights=probs, k=min(k, len(shamers)))
-            seen = set()
+            chosen = self._weighted_sample_without_replacement(
+                shamers, weights, min(k, len(shamers))
+            )
             for a in chosen:
-                if id(a) not in seen:
-                    a._next_state = NEUTRAL
-                    seen.add(id(a))
+                a.choose_neutral()
+
+    def _weighted_sample_without_replacement(
+        self,
+        agents: list[CountryAgent],
+        weights: list[float],
+        k: int,
+    ) -> list[CountryAgent]:
+        """
+        Draw up to k unique agents using weights.
+
+        Python's random.choices samples with replacement. The previous code
+        handled duplicates with a seen set after the draw, which meant fewer
+        than k agents could change state. This helper removes each selected
+        agent before the next draw, so k means k distinct choices whenever
+        enough candidates exist.
+        """
+        remaining_agents = list(agents)
+        remaining_weights = list(weights)
+        chosen: list[CountryAgent] = []
+
+        while remaining_agents and len(chosen) < k:
+            selected = self.random.choices(
+                remaining_agents,
+                weights=remaining_weights,
+                k=1,
+            )[0]
+            idx = remaining_agents.index(selected)
+            chosen.append(selected)
+            remaining_agents.pop(idx)
+            remaining_weights.pop(idx)
+
+        return chosen
 
     # ── Statistics ────────────────────────────────────────────────────────────
 
     def _count(self, state: str) -> int:
         return sum(1 for a in self._agent_list if a.state == state)
+
+    def _mean_threshold(self) -> float:
+        vals = [a.threshold for a in self._agent_list]
+        return round(sum(vals) / len(vals), 4) if vals else 0.0
+
+    def _std_threshold(self) -> float:
+        import math
+        vals = [a.threshold for a in self._agent_list]
+        if not vals:
+            return 0.0
+        mu = sum(vals) / len(vals)
+        return round(math.sqrt(sum((v - mu) ** 2 for v in vals) / len(vals)), 4)
+
+    def _norm_eroding(self) -> float:
+        """
+        Fraction of agents whose beta_param has risen above their initial
+        value — proxy for how many agents have internalised non-shaming
+        as acceptable behaviour (Barnett & Finnemore 2004).
+        Computed relative to regime baseline betas.
+        """
+        eroding = 0
+        for a in self._agent_list:
+            if a.beta_param > a.baseline_beta(self.beta_scale):
+                eroding += 1
+        return round(eroding / self.N_AGENTS, 4)
 
     def _regime_count(self, regime: str, state: str) -> int:
         return sum(1 for a in self._agent_list
@@ -651,15 +645,17 @@ class UNModel(Model):
     def get_stats(self) -> dict:
         shaming = self._count(SHAME)
         return {
-            "step":      self.step_count,
-            "shaming":   shaming,
-            "neutral":   self.N_AGENTS - shaming,
-            "pct_shame": round(100 * shaming / self.N_AGENTS, 1),
-            "dem_pct":   self._regime_pct(DEMOCRACY),
-            "ndem_pct":  self._regime_pct(NON_DEMOCRACY),
+            "step":           self.step_count,
+            "shaming":        shaming,
+            "neutral":        self.N_AGENTS - shaming,
+            "pct_shame":      round(100 * shaming / self.N_AGENTS, 1),
+            "dem_pct":        self._regime_pct(DEMOCRACY),
+            "ndem_pct":       self._regime_pct(NON_DEMOCRACY),
+            "mean_threshold": self._mean_threshold(),
+            "std_threshold":  self._std_threshold(),
+            "norm_eroding":   round(self._norm_eroding() * 100, 1),
         }
 
     def reset(self) -> None:
         self.step_count = 0
-        for a in self._agent_list:
-            a.reset(NEUTRAL)
+        self.agents.do("reset", NEUTRAL)
