@@ -1,4 +1,4 @@
-# UN Shaming Cascade
+# Modeling UN HRC Naming & Shaming
 
 A Mesa 3.x agent-based model of how naming-and-shaming norms emerge, weaken,
 and re-form in UN-style human-rights forums. The model is motivated by the UN
