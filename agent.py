@@ -188,9 +188,9 @@ class CountryAgent(Agent):
         """
         Return this agent's weighted eligibility to become SHAME.
 
-        The agent joins the candidate pool only when current neighbour pressure
-        crosses its personal Granovetter threshold. P5 shaming neighbours double
-        the recruitment weight.
+        The agent joins the candidate pool only when incoming pressure from
+        shaming states crosses its personal Granovetter threshold. P5 shaming
+        sources double the recruitment weight.
         """
         if self._next_state != NEUTRAL:
             return 0.0
@@ -199,8 +199,11 @@ class CountryAgent(Agent):
         max_pressure = 0.0
         p5_bonus = 1.0
 
-        for nb_node in graph.neighbors(self.pos):
-            edge_weight = graph[self.pos][nb_node].get("weight", 0.1)
+        # In the directed forum graph, source -> self means source is exerting
+        # pressure on this agent. Outgoing edges are this agent's influence on
+        # others, so they should not determine this agent's own recruitment.
+        for nb_node in graph.predecessors(self.pos):
+            edge_weight = graph[nb_node][self.pos].get("weight", 0.1)
             max_pressure += edge_weight
             for neighbour in grid.get_cell_list_contents([nb_node]):
                 if neighbour._next_state == SHAME:

@@ -3,7 +3,7 @@ app.py — UN Shaming Cascade visualised with Mesa SolaraViz.
 
 Layout (top → bottom):
   1. Live counter  — step, shaming, neutral, dem/non-dem, P5 counts
-  2. Network map   — complete forum ties weighted by strength and regime
+  2. Network map   — directed forum ties weighted by source influence and regime
   3. Shaming plot  — Shaming vs Neutral over time
   4. Regime plot   — Democracy vs Non-democracy shaming over time
 
@@ -12,7 +12,7 @@ Network portrayal
   Node colour   : Red (#e8003d) = shaming, Dark-blue (#1e3a5f) = neutral
   Node border   : White = democracy, Amber = non-democracy
   Node size     : Scaled by diplomatic_strength (GDI 2024); P5 always largest
-  Edge colour   : Brightness proportional to forum tie weight
+  Edge colour   : Brightness proportional to directed forum tie weight
   Edge width    : Proportional to edge weight
   Tooltip       : Country name, state, regime, GDI strength score, P5 status
 """
@@ -145,8 +145,8 @@ def NetworkMap(model):
         # Compute normalised pressure for tooltip
         raw_p = 0.0
         max_p = 0.0
-        for nb_node in G.neighbors(i):
-            ew = G[i][nb_node].get("weight", 0.1)
+        for nb_node in G.predecessors(i):
+            ew = G[nb_node][i].get("weight", 0.1)
             max_p += ew
             for nbr in model.grid.get_cell_list_contents([nb_node]):
                 if nbr.state == SHAME:
@@ -205,7 +205,7 @@ def NetworkMap(model):
         title=dict(
             text=(
                 f"UN Shaming Cascade · 193 member states · "
-                f"complete forum network · weighted by strength + regime affinity<br>"
+                f"complete directed forum network · edge = source influence on target<br>"
                 f"<sup>Step {s['step']} · {s['shaming']} shaming "
                 f"({s['pct_shame']}%) · Left = Democracies · "
                 f"Right = Non-democracies · Node size ∝ diplomatic strength</sup>"

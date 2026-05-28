@@ -13,9 +13,9 @@ Source: Lowy Institute Global Diplomacy Index 2024.
 
 Forum network
 ─────────────
-The UN forum is represented as a complete weighted graph: every state can
-observe every other state, but influence is uneven. Edge weights combine
-diplomatic strength, regime affinity, and a small P5 amplification.
+The UN forum is represented as a complete directed weighted graph: every state
+can observe every other state, but influence is asymmetric. An edge A -> B
+measures how much pressure A's public position places on B.
 
 Spreading mechanic
 ──────────────────
@@ -339,38 +339,36 @@ def _safe_int(value, default: int) -> int:
 
 def _build_un_network(
     agents: list,
-) -> nx.Graph:
+) -> nx.DiGraph:
     """
-    Build a complete weighted forum network.
+    Build a complete directed weighted forum network.
 
     In the UN, every state can observe every other state's public position.
-    The model therefore gives every pair a tie and lets the edge weight encode
-    how persuasive or salient that tie is:
+    The model therefore gives every ordered pair a tie and lets edge direction
+    encode asymmetric influence:
 
-      influence core   = 0.20 + 0.80 * average diplomatic strength
+      edge A -> B      = pressure from A on B
+      influence core   = 0.10 + 0.90 * diplomatic strength of A
       regime affinity  = 1.00 for same-regime pairs, 0.65 otherwise
-      P5 visibility    = 1.15 when either endpoint is a P5 member
+      P5 visibility    = 1.25 when A is a P5 member
 
-    The 0.20 floor keeps weak states visible in the forum, while strength,
-    regime affinity, and P5 status determine how much pressure flows.
+    This makes a P5 member's pressure on a small state much larger than the
+    small state's pressure on the P5 member, while still keeping both states
+    formally visible to one another in the forum.
     """
-    G = nx.Graph()
+    G = nx.DiGraph()
     G.add_nodes_from(range(len(agents)))
 
-    for u in range(len(agents)):
-        for v in range(u + 1, len(agents)):
-            a = agents[u]
-            b = agents[v]
-            avg_strength = (a.diplomatic_strength + b.diplomatic_strength) / 2
-            influence = 0.20 + (0.80 * avg_strength)
-            regime_affinity = 1.00 if a.regime == b.regime else 0.65
-            p5_visibility = (
-                1.15
-                if a.country_name in P5_NAMES or b.country_name in P5_NAMES
-                else 1.00
-            )
-            weight = min(1.0, influence * regime_affinity * p5_visibility)
-            G.add_edge(u, v, weight=round(max(0.01, weight), 4))
+    for source_idx, source in enumerate(agents):
+        for target_idx, target in enumerate(agents):
+            if source_idx == target_idx:
+                continue
+
+            source_influence = 0.10 + (0.90 * source.diplomatic_strength)
+            regime_affinity = 1.00 if source.regime == target.regime else 0.65
+            p5_visibility = 1.25 if source.country_name in P5_NAMES else 1.00
+            weight = min(1.0, source_influence * regime_affinity * p5_visibility)
+            G.add_edge(source_idx, target_idx, weight=round(max(0.01, weight), 4))
 
     return G
 
@@ -431,7 +429,7 @@ class UNModel(Model):
         self._agent_list: list[CountryAgent] = []
         self._build_agents()
 
-        # Build the complete weighted forum network and attach Mesa NetworkGrid.
+        # Build the complete directed forum network and attach Mesa NetworkGrid.
         self.G    = _build_un_network(self._agent_list)
         self.grid = NetworkGrid(self.G)
 
